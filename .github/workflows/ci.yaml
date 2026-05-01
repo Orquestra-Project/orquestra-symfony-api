@@ -53,9 +53,9 @@ jobs:
       - name: Create test database
         run: docker compose exec -T php bin/console -e test doctrine:database:create
       # Uncomment if Doctrine Migrations is installed
-      - name: Run migrations
-        run: docker compose exec -T php bin/console -e test doctrine:migrations:migrate
-          --no-interaction
+      # - name: Run migrations
+      #   run: docker compose exec -T php bin/console -e test doctrine:migrations:migrate
+      #     --no-interaction
       # Uncomment if PHPUnit is installed
       - name: Run PHPUnit
         run: docker compose exec -T php bin/phpunit
