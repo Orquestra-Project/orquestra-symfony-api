@@ -79,4 +79,4 @@ jobs:
       - name: Run PHP-CS-Fixer
         uses: docker://ghcr.io/php-cs-fixer/php-cs-fixer:3-php8.5
         with:
-          args: check --dry-run --diff
+          args: check --diff
