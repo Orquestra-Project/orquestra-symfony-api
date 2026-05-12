@@ -42,9 +42,138 @@ RUN install-php-extensions pdo_pgsql
 ###< doctrine/doctrine-bundle ###
 ###< recipes ###
 
-COPY --link frankenphp/conf.d/10-app.ini $PHP_INI_DIR/app.conf.d/
-COPY --link --chmod=755 frankenphp/docker-entrypoint.sh /usr/local/bin/docker-entrypoint
-COPY --link frankenphp/Caddyfile /etc/frankenphp/Caddyfile
+RUN <<-'EOF' cat > $PHP_INI_DIR/app.conf.d/10-app.ini
+expose_php = 0
+date.timezone = UTC
+apc.enable_cli = 1
+session.use_strict_mode = 1
+zend.detect_unicode = 0
+
+; https://symfony.com/doc/current/performance.html
+realpath_cache_size = 4096K
+realpath_cache_ttl = 600
+opcache.interned_strings_buffer = 16
+opcache.max_accelerated_files = 32531
+opcache.memory_consumption = 256
+opcache.enable_file_override = 1
+EOF
+
+RUN <<-'EOF' cat > /usr/local/bin/docker-entrypoint
+#!/bin/sh
+set -e
+
+if [ "$1" = 'frankenphp' ] || [ "$1" = 'php' ] || [ "$1" = 'bin/console' ]; then
+
+	if [ -z "$(ls -A 'vendor/' 2>/dev/null)" ]; then
+		composer install --prefer-dist --no-progress --no-interaction
+	fi
+
+	# Display information about the current project
+	# Or about an error in project initialization
+	php bin/console -V
+
+	if grep -q ^DATABASE_URL= .env; then
+		echo 'Waiting for database to be ready...'
+		ATTEMPTS_LEFT_TO_REACH_DATABASE=60
+		until [ $ATTEMPTS_LEFT_TO_REACH_DATABASE -eq 0 ] || DATABASE_ERROR=$(php bin/console dbal:run-sql -q "SELECT 1" 2>&1); do
+			if [ $? -eq 255 ]; then
+				# If the Doctrine command exits with 255, an unrecoverable error occurred
+				ATTEMPTS_LEFT_TO_REACH_DATABASE=0
+				break
+			fi
+			sleep 1
+			ATTEMPTS_LEFT_TO_REACH_DATABASE=$((ATTEMPTS_LEFT_TO_REACH_DATABASE - 1))
+			echo "Still waiting for database to be ready... Or maybe the database is not reachable. $ATTEMPTS_LEFT_TO_REACH_DATABASE attempts left."
+		done
+
+		if [ $ATTEMPTS_LEFT_TO_REACH_DATABASE -eq 0 ]; then
+			echo 'The database is not up or not reachable:'
+			echo "$DATABASE_ERROR"
+			exit 1
+		else
+			echo 'The database is now ready and reachable'
+		fi
+
+		if [ "$(find ./migrations -iname '*.php' -print -quit)" ]; then
+			php bin/console doctrine:migrations:migrate --no-interaction --all-or-nothing
+		fi
+	fi
+
+	echo 'PHP app ready!'
+fi
+
+exec docker-php-entrypoint "$@"
+EOF
+RUN chmod 755 /usr/local/bin/docker-entrypoint
+
+RUN mkdir -p /etc/frankenphp && <<-'EOF' cat > /etc/frankenphp/Caddyfile
+{
+	skip_install_trust
+
+	{$CADDY_GLOBAL_OPTIONS}
+
+	frankenphp {
+		{$FRANKENPHP_CONFIG}
+	}
+}
+
+{$CADDY_EXTRA_CONFIG}
+
+{$SERVER_NAME:localhost} {
+	log {
+		{$CADDY_SERVER_LOG_OPTIONS}
+		# Redact the authorization query parameter that can be set by Mercure
+		format filter {
+			request>uri query {
+				replace authorization REDACTED
+			}
+		}
+	}
+
+	root /app/public
+	encode zstd br gzip
+
+	mercure {
+		# Publisher JWT key
+		publisher_jwt {env.MERCURE_PUBLISHER_JWT_KEY} {env.MERCURE_PUBLISHER_JWT_ALG}
+		# Subscriber JWT key
+		subscriber_jwt {env.MERCURE_SUBSCRIBER_JWT_KEY} {env.MERCURE_SUBSCRIBER_JWT_ALG}
+		# Allow anonymous subscribers (double-check that it's what you want)
+		anonymous
+		# Enable the subscription API (double-check that it's what you want)
+		subscriptions
+		# Extra directives
+		{$MERCURE_EXTRA_DIRECTIVES}
+	}
+
+	vulcain
+
+	{$CADDY_SERVER_EXTRA_DIRECTIVES}
+
+	# Disable Topics tracking if not enabled explicitly: https://github.com/jkarlin/topics
+	header ?Permissions-Policy "browsing-topics=()"
+
+	@phpRoute {
+		not path /.well-known/mercure*
+		not file {path}
+	}
+	rewrite @phpRoute index.php
+
+	@frontController path index.php
+	php @frontController {
+		{$FRANKENPHP_SITE_CONFIG}
+
+		worker {
+			file ./public/index.php
+			{$FRANKENPHP_WORKER_CONFIG}
+		}
+	}
+
+	file_server {
+		hide *.php
+	}
+}
+EOF
 
 ENTRYPOINT ["docker-entrypoint"]
 
@@ -80,7 +209,13 @@ RUN <<-EOF
 	git config --system --add safe.directory /app
 EOF
 
-COPY --link frankenphp/conf.d/20-app.dev.ini $PHP_INI_DIR/app.conf.d/
+RUN <<-'EOF' cat > $PHP_INI_DIR/app.conf.d/20-app.dev.ini
+; See https://docs.docker.com/desktop/features/networking/networking-how-tos/#connect-a-container-to-a-service-on-the-host
+; See https://github.com/docker/for-linux/issues/264
+; The `client_host` below may optionally be replaced with `discover_client_host=yes`
+; Add `start_with_request=yes` to start debug session on each request
+xdebug.client_host = host.docker.internal
+EOF
 
 CMD [ "frankenphp", "run", "--config", "/etc/frankenphp/Caddyfile", "--watch" ]
 
@@ -91,7 +226,13 @@ ENV APP_ENV=prod
 
 RUN mv "$PHP_INI_DIR/php.ini-production" "$PHP_INI_DIR/php.ini"
 
-COPY --link frankenphp/conf.d/20-app.prod.ini $PHP_INI_DIR/app.conf.d/
+RUN <<-'EOF' cat > $PHP_INI_DIR/app.conf.d/20-app.prod.ini
+; https://symfony.com/doc/current/performance.html#use-the-opcache-class-preloading
+opcache.preload_user = root
+opcache.preload = /app/config/preload.php
+; https://symfony.com/doc/current/performance.html#don-t-check-php-files-timestamps
+opcache.validate_timestamps = 0
+EOF
 
 # prevent the reinstallation of vendors at every changes in the source code
 COPY --link composer.* symfony.* ./
@@ -169,7 +310,53 @@ COPY --link --exclude=var --from=frankenphp_prod_builder /app /app
 COPY --chown=www-data:0 --from=frankenphp_prod_builder /app/var /app/var
 RUN chmod g=u /app/var
 
-COPY --link --chmod=755 frankenphp/docker-entrypoint.sh /usr/local/bin/docker-entrypoint
+RUN <<-'EOF' cat > /usr/local/bin/docker-entrypoint
+#!/bin/sh
+set -e
+
+if [ "$1" = 'frankenphp' ] || [ "$1" = 'php' ] || [ "$1" = 'bin/console' ]; then
+
+	if [ -z "$(ls -A 'vendor/' 2>/dev/null)" ]; then
+		composer install --prefer-dist --no-progress --no-interaction
+	fi
+
+	# Display information about the current project
+	# Or about an error in project initialization
+	php bin/console -V
+
+	if grep -q ^DATABASE_URL= .env; then
+		echo 'Waiting for database to be ready...'
+		ATTEMPTS_LEFT_TO_REACH_DATABASE=60
+		until [ $ATTEMPTS_LEFT_TO_REACH_DATABASE -eq 0 ] || DATABASE_ERROR=$(php bin/console dbal:run-sql -q "SELECT 1" 2>&1); do
+			if [ $? -eq 255 ]; then
+				# If the Doctrine command exits with 255, an unrecoverable error occurred
+				ATTEMPTS_LEFT_TO_REACH_DATABASE=0
+				break
+			fi
+			sleep 1
+			ATTEMPTS_LEFT_TO_REACH_DATABASE=$((ATTEMPTS_LEFT_TO_REACH_DATABASE - 1))
+			echo "Still waiting for database to be ready... Or maybe the database is not reachable. $ATTEMPTS_LEFT_TO_REACH_DATABASE attempts left."
+		done
+
+		if [ $ATTEMPTS_LEFT_TO_REACH_DATABASE -eq 0 ]; then
+			echo 'The database is not up or not reachable:'
+			echo "$DATABASE_ERROR"
+			exit 1
+		else
+			echo 'The database is now ready and reachable'
+		fi
+
+		if [ "$(find ./migrations -iname '*.php' -print -quit)" ]; then
+			php bin/console doctrine:migrations:migrate --no-interaction --all-or-nothing
+		fi
+	fi
+
+	echo 'PHP app ready!'
+fi
+
+exec docker-php-entrypoint "$@"
+EOF
+RUN chmod 755 /usr/local/bin/docker-entrypoint
 
 USER www-data
 
