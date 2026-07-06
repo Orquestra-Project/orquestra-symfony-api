@@ -48,6 +48,7 @@ jobs:
       #   run: curl -v --insecure --fail-with-body https://localhost
       - name: Check Mercure reachability
         run: curl -vI --insecure --fail-with-body
+          --resolve localhost:443:127.0.0.1 
           https://localhost/.well-known/mercure?topic=test
       # Uncomment if Doctrine ORM is installed
       - name: Create test database
