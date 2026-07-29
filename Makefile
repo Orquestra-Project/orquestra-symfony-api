@@ -49,6 +49,10 @@ vendor: ## Install vendors according to the current composer.lock file
 vendor: c=install --prefer-dist --no-dev --no-progress --no-scripts --no-interaction
 vendor: composer
 
+reset_vendor: ## Reinstall depedencies to fix docker restarting after update
+	@$(DOCKER_COMP) run --rm php composer install --prefer-dist --no-progress --no-scripts --no-interaction
+
+
 sf: ## List all Symfony commands or pass the parameter "c=" to run a given command, example: make sf c=about
 	@$(eval c ?=)
 	@$(SYMFONY) $(c)
